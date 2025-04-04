@@ -4,7 +4,7 @@ from typing import List, Tuple
 import torch
 import torchaudio
 from huggingface_hub import hf_hub_download
-from models import Model
+from models import Model, ModelArgs
 from moshi.models import loaders
 from tokenizers.processors import TemplateProcessing
 from transformers import AutoTokenizer
@@ -73,8 +73,6 @@ class Generator:
         return torch.cat(frame_tokens, dim=0), torch.cat(frame_masks, dim=0)
 
     def _tokenize_audio(self, audio: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert audio.ndim == 1, "Audio must be single channel"
-
         frame_tokens = []
         frame_masks = []
 
@@ -117,7 +115,7 @@ class Generator:
     ) -> torch.Tensor:
         self._model.reset_caches()
 
-        max_generation_len = int(max_audio_length_ms / 80)
+        max_audio_frames = int(max_audio_length_ms / 80)
         tokens, tokens_mask = [], []
         for segment in context:
             segment_tokens, segment_tokens_mask = self._tokenize_segment(segment)
@@ -136,14 +134,11 @@ class Generator:
         curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
         curr_pos = torch.arange(0, prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
 
-        max_seq_len = 2048
-        max_context_len = max_seq_len - max_generation_len
-        if curr_tokens.size(1) >= max_context_len:
-            raise ValueError(
-                f"Inputs too long, must be below max_seq_len - max_generation_len: {max_context_len}"
-            )
+        max_seq_len = 2048 - max_audio_frames
+        if curr_tokens.size(1) >= max_seq_len:
+            raise ValueError(f"Inputs too long, must be below max_seq_len - max_audio_frames: {max_seq_len}")
 
-        for _ in range(max_generation_len):
+        for _ in range(max_audio_frames):
             sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
             if torch.all(sample == 0):
                 break  # eos
@@ -166,11 +161,65 @@ class Generator:
         audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
 
         return audio
+    
+    @torch.inference_mode()
+    def generate_from_tokens(
+        self,
+        prompt_tokens: torch.Tensor,
+        prompt_tokens_mask: torch.Tensor,
+        max_audio_length_ms: float = 90_000,
+        temperature: float = 0.9,
+        topk: int = 50,
+    ) -> torch.Tensor:
+        self._model.reset_caches()
+
+        max_audio_frames = int(max_audio_length_ms / 80)
+
+        samples = []
+        curr_tokens = prompt_tokens.unsqueeze(0)
+        curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
+        curr_pos = torch.arange(0, prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
+
+        max_seq_len = 2048 - max_audio_frames
+        if curr_tokens.size(1) >= max_seq_len:
+            raise ValueError(f"Inputs too long, must be below max_seq_len - max_audio_frames: {max_seq_len}")
+
+        for _ in range(max_audio_frames):
+            sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
+            if torch.all(sample == 0):
+                break  # eos
+
+            samples.append(sample)
+
+            curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
+            curr_tokens_mask = torch.cat(
+                [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
+            ).unsqueeze(1)
+            curr_pos = curr_pos[:, -1:] + 1
+
+        # audio = self._audio_tokenizer.decode(torch.stack(samples).permute(1, 2, 0)).squeeze(0).squeeze(0)
+
+        # This applies an imperceptible watermark to identify audio as AI-generated.
+        # Watermarking ensures transparency, dissuades misuse, and enables traceability.
+        # Please be a responsible AI citizen and keep the watermarking in place.
+        # If using CSM 1B in another application, use your own private key and keep it secret.
+        # audio, wm_sample_rate = watermark(self._watermarker, audio, self.sample_rate, CSM_1B_GH_WATERMARK)
+        # audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
+
+        return torch.stack(samples).permute(1, 2, 0)
 
 
-def load_csm_1b(device: str = "cuda") -> Generator:
-    model = Model.from_pretrained("sesame/csm-1b")
-    model.to(device=device, dtype=torch.bfloat16)
+def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda") -> Generator:
+    model_args = ModelArgs(
+        backbone_flavor="llama-1B",
+        decoder_flavor="llama-100M",
+        text_vocab_size=128256,
+        audio_vocab_size=2051,
+        audio_num_codebooks=32,
+    )
+    model = Model(model_args).to(device=device, dtype=torch.float32)
+    state_dict = torch.load(ckpt_path)
+    model.load_state_dict(state_dict)
 
     generator = Generator(model)
     return generator
