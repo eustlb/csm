@@ -162,11 +162,12 @@ class Generator:
 
         return audio
     
-    @torch.inference_mode()
-    def generate_from_tokens(
+    @torch.inference_mode() 
+    def generate_return_tokens(
         self,
-        prompt_tokens: torch.Tensor,
-        prompt_tokens_mask: torch.Tensor,
+        text: str,
+        speaker: int,
+        context: List[Segment],
         max_audio_length_ms: float = 90_000,
         temperature: float = 0.9,
         topk: int = 50,
@@ -174,11 +175,26 @@ class Generator:
         self._model.reset_caches()
 
         max_audio_frames = int(max_audio_length_ms / 80)
+        tokens, tokens_mask = [], []
+        for segment in context:
+            segment_tokens, segment_tokens_mask = self._tokenize_segment(segment)
+            tokens.append(segment_tokens)
+            tokens_mask.append(segment_tokens_mask)
+
+        gen_segment_tokens, gen_segment_tokens_mask = self._tokenize_text_segment(text, speaker)
+        tokens.append(gen_segment_tokens)
+        tokens_mask.append(gen_segment_tokens_mask)
+
+        prompt_tokens = torch.cat(tokens, dim=0).long().to(self.device)
+        prompt_tokens_mask = torch.cat(tokens_mask, dim=0).bool().to(self.device)
 
         samples = []
         curr_tokens = prompt_tokens.unsqueeze(0)
         curr_tokens_mask = prompt_tokens_mask.unsqueeze(0)
         curr_pos = torch.arange(0, prompt_tokens.size(0)).unsqueeze(0).long().to(self.device)
+
+        input_tokens = curr_tokens.clone()
+        input_tokens_mask = curr_tokens_mask.clone()
 
         max_seq_len = 2048 - max_audio_frames
         if curr_tokens.size(1) >= max_seq_len:
@@ -197,16 +213,7 @@ class Generator:
             ).unsqueeze(1)
             curr_pos = curr_pos[:, -1:] + 1
 
-        # audio = self._audio_tokenizer.decode(torch.stack(samples).permute(1, 2, 0)).squeeze(0).squeeze(0)
-
-        # This applies an imperceptible watermark to identify audio as AI-generated.
-        # Watermarking ensures transparency, dissuades misuse, and enables traceability.
-        # Please be a responsible AI citizen and keep the watermarking in place.
-        # If using CSM 1B in another application, use your own private key and keep it secret.
-        # audio, wm_sample_rate = watermark(self._watermarker, audio, self.sample_rate, CSM_1B_GH_WATERMARK)
-        # audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
-
-        return torch.stack(samples).permute(1, 2, 0)
+        return input_tokens, input_tokens_mask, torch.stack(samples).permute(1, 0, 2)
 
 
 def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda") -> Generator:
